@@ -1,127 +1,92 @@
-const { default: makeWASocket, useSingleFileAuthState, DisconnectReason } = require('@adiwajshing/baileys');
+const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason } = require('@adiwajshing/baileys');
 const P = require('pino');
-const fs = require('fs');
-
-const authFile = './auth_info.json';
-const { state, saveState } = useSingleFileAuthState(authFile);
-
-const store = {}; // In-memory store of messages: { chatId: { msgId: messageObject } }
-const antiDeleteChats = new Set(); // Chats with Anti-Delete ON
+const qrcode = require('qrcode-terminal');
 
 async function startBot() {
-    const sock = makeWASocket({
-        printQRInTerminal: true,
-        auth: state,
-        logger: P({ level: 'silent' }),
-    });
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
 
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update;
-        if(connection === 'close') {
-            if(lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut) {
-                startBot();
-            } else {
-                console.log('Logged out, please delete auth file and restart.');
-            }
-        } else if(connection === 'open') {
-            console.log('Bot connected');
-        }
-    });
+  const { version, isLatest } = await fetchLatestBaileysVersion();
+  console.log(`Using WhatsApp Web v${version.join('.')}, isLatest: ${isLatest}`);
 
-    sock.ev.on('creds.update', saveState);
+  const sock = makeWASocket({
+    version,
+    printQRInTerminal: true,
+    auth: state,
+    logger: P({ level: 'silent' }),
+  });
 
-    // Store incoming messages
-    sock.ev.on('messages.upsert', async (m) => {
-        if(m.type !== 'notify') return;
+  sock.ev.on('creds.update', saveCreds);
 
-        for(const msg of m.messages) {
-            if(!msg.message) continue;
-            if(msg.key && msg.key.remoteJid && msg.key.id) {
-                const chatId = msg.key.remoteJid;
-                const msgId = msg.key.id;
+  // Display QR code in terminal for scanning
+  sock.ev.on('connection.update', (update) => {
+    const { connection, qr, lastDisconnect } = update;
+    if (qr) {
+      qrcode.generate(qr, { small: true });
+      console.log('Scan the QR code above to log in.');
+    }
+    if (connection === 'close') {
+      const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log('Connection closed. Reconnecting:', shouldReconnect);
+      if (shouldReconnect) {
+        startBot();
+      }
+    } else if (connection === 'open') {
+      console.log('Connected to WhatsApp!');
+    }
+  });
 
-                // Initialize chat storage
-                if(!store[chatId]) store[chatId] = {};
+  // Store messages for anti-delete
+  const messageStore = new Map();
 
-                // Store the message object for recovery
-                store[chatId][msgId] = msg;
+  // Listen to all messages
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type === 'notify') {
+      for (const msg of messages) {
+        if (!msg.message) continue;
+        const messageId = msg.key.id;
+        const from = msg.key.remoteJid;
 
-                // Optional: Clean old messages to save memory (e.g., older than 1 hour)
-                // TODO: Implement cleanup if needed
-            }
-        }
-    });
+        // Store messages to catch deletions later
+        messageStore.set(messageId, msg);
 
-    // Listen to message delete events
-    sock.ev.on('messages.update', async (updates) => {
-        for(const update of updates) {
-            if(update.updateType === 'message-revoke') {
-                const { key } = update;
-                const chatId = key.remoteJid;
-                const msgId = key.id;
+        // Log incoming message
+        const text = getMessageContent(msg.message);
+        console.log(`[${from}] Message received: ${text}`);
+      }
+    }
+  });
 
-                if(antiDeleteChats.has(chatId) && store[chatId] && store[chatId][msgId]) {
-                    const deletedMsg = store[chatId][msgId];
-                    const sender = deletedMsg.key.participant || deletedMsg.key.remoteJid;
-                    const messageContent = extractMessageContent(deletedMsg.message);
+  // Listen to message deletion (MessageInfo type: "messages.delete")
+  sock.ev.on('messages.delete', async (deletes) => {
+    for (const msg of deletes) {
+      const { remoteJid, id, fromMe } = msg;
+      const deletedMsg = messageStore.get(id);
+      if (deletedMsg) {
+        const sender = deletedMsg.key.participant || deletedMsg.key.remoteJid;
+        const deletedText = getMessageContent(deletedMsg.message);
 
-                    const senderTag = sender.includes('@') ? `@${sender.split('@')[0]}` : sender;
+        console.log(`Message deleted by ${sender} in ${remoteJid}: ${deletedText}`);
 
-                    const infoText = `*🚫 Deleted message detected!* \n` +
-                                     `*Deleted by:* ${senderTag}\n` +
-                                     `*Content:* ${messageContent}`;
+        // Anti-delete: Send message info back to the chat
+        await sock.sendMessage(remoteJid, {
+          text: `⚠️ Someone deleted a message:\n${deletedText}`
+        });
+      }
+    }
+  });
 
-                    await sock.sendMessage(chatId, {
-                        text: infoText,
-                        mentions: [sender]
-                    });
-                }
-            }
-        }
-    });
-
-    // Command handler to toggle anti-delete per chat
-    sock.ev.on('messages.upsert', async (m) => {
-        if(m.type !== 'notify') return;
-
-        for(const msg of m.messages) {
-            if(!msg.message || !msg.key.fromMe) continue; // Only react to own messages (bot commands)
-            const chatId = msg.key.remoteJid;
-            const text = getMessageText(msg.message);
-
-            if(!text) continue;
-
-            if(text.toLowerCase() === '!antidelete on') {
-                antiDeleteChats.add(chatId);
-                await sock.sendMessage(chatId, { text: '✅ Anti-Delete is now *ON* for this chat.' });
-            } else if(text.toLowerCase() === '!antidelete off') {
-                antiDeleteChats.delete(chatId);
-                await sock.sendMessage(chatId, { text: '❌ Anti-Delete is now *OFF* for this chat.' });
-            }
-        }
-    });
-
-    return sock;
+  function getMessageContent(message) {
+    if (message.conversation) return message.conversation;
+    if (message.extendedTextMessage) return message.extendedTextMessage.text;
+    if (message.imageMessage && message.imageMessage.caption) return message.imageMessage.caption;
+    if (message.videoMessage && message.videoMessage.caption) return message.videoMessage.caption;
+    if (message.documentMessage && message.documentMessage.caption) return message.documentMessage.caption;
+    if (message.stickerMessage) return '[Sticker]';
+    if (message.audioMessage) return '[Audio]';
+    if (message.contactMessage) return '[Contact]';
+    if (message.locationMessage) return '[Location]';
+    return '[Unknown message type]';
+  }
 }
 
-// Helper: Extract text content from various WhatsApp message types
-function extractMessageContent(message) {
-    if(message.conversation) return message.conversation;
-    if(message.extendedTextMessage && message.extendedTextMessage.text) return message.extendedTextMessage.text;
-    if(message.imageMessage && message.imageMessage.caption) return message.imageMessage.caption;
-    if(message.videoMessage && message.videoMessage.caption) return message.videoMessage.caption;
-    if(message.stickerMessage) return '[Sticker]';
-    if(message.audioMessage) return '[Audio]';
-    if(message.documentMessage) return '[Document]';
-    if(message.contactMessage) return '[Contact Card]';
-    return '[Unsupported message type]';
-}
-
-// Helper: Get raw text from message for command processing
-function getMessageText(message) {
-    if(message.conversation) return message.conversation;
-    if(message.extendedTextMessage && message.extendedTextMessage.text) return message.extendedTextMessage.text;
-    return '';
-}
-
-startBot().catch(console.error);
+startBot();
